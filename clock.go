@@ -58,6 +58,10 @@ type Mock struct {
 	mu     sync.Mutex
 	now    time.Time   // current time
 	timers clockTimers // tickers & timers
+
+	calls      Calls
+	waiting    []waiting
+	callsMutex sync.Mutex
 }
 
 // NewMock returns an instance of a mock clock.
@@ -121,12 +125,14 @@ func (m *Mock) runNextTimer(max time.Time) bool {
 
 // After waits for the duration to elapse and then sends the current time on the returned channel.
 func (m *Mock) After(d time.Duration) <-chan time.Time {
+	defer m.inc(&m.calls.After)
 	return m.Timer(d).C
 }
 
 // AfterFunc waits for the duration to elapse and then executes a function.
 // A Timer is returned that can be stopped.
 func (m *Mock) AfterFunc(d time.Duration, f func()) *Timer {
+	defer m.inc(&m.calls.AfterFunc)
 	t := m.Timer(d)
 	t.C = nil
 	t.fn = f
@@ -135,6 +141,7 @@ func (m *Mock) AfterFunc(d time.Duration, f func()) *Timer {
 
 // Now returns the current wall time on the mock clock.
 func (m *Mock) Now() time.Time {
+	defer m.inc(&m.calls.Now)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.now
@@ -143,17 +150,20 @@ func (m *Mock) Now() time.Time {
 // Sleep pauses the goroutine for the given duration on the mock clock.
 // The clock must be moved forward in a separate goroutine.
 func (m *Mock) Sleep(d time.Duration) {
+	defer m.inc(&m.calls.Sleep)
 	<-m.After(d)
 }
 
 // Tick is a convenience function for Ticker().
 // It will return a ticker channel that cannot be stopped.
 func (m *Mock) Tick(d time.Duration) <-chan time.Time {
+	defer m.inc(&m.calls.Tick)
 	return m.Ticker(d).C
 }
 
 // Ticker creates a new instance of Ticker.
 func (m *Mock) Ticker(d time.Duration) *Ticker {
+	defer m.inc(&m.calls.Ticker)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ch := make(chan time.Time)
@@ -170,6 +180,7 @@ func (m *Mock) Ticker(d time.Duration) *Ticker {
 
 // Timer creates a new instance of Timer.
 func (m *Mock) Timer(d time.Duration) *Timer {
+	defer m.inc(&m.calls.Timer)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ch := make(chan time.Time)
@@ -195,6 +206,37 @@ func (m *Mock) removeClockTimer(t clockTimer) {
 		}
 	}
 	sort.Sort(m.timers)
+}
+
+func (m *Mock) inc(addr *uint32) {
+	m.callsMutex.Lock()
+	defer m.callsMutex.Unlock()
+	*addr++
+	var newWaiting []waiting
+	for _, w := range m.waiting {
+		if m.calls.atLeast(w.expected) {
+			close(w.done)
+			continue
+		}
+		newWaiting = append(newWaiting, w)
+	}
+	m.waiting = newWaiting
+}
+
+// Wait waits for at least the relevant calls before returning. The expected
+// Calls are always over the lifetime of the Mock. Values in the Calls struct
+// are used as the minimum number of calls, this allows you to wait for only
+// the calls you care about.
+func (m *Mock) Wait(s Calls) {
+	m.callsMutex.Lock()
+	if m.calls.atLeast(s) {
+		m.callsMutex.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	m.waiting = append(m.waiting, waiting{expected: s, done: done})
+	m.callsMutex.Unlock()
+	<-done
 }
 
 // clockTimer represents an object with an associated start time.
@@ -276,3 +318,46 @@ func (t *internalTicker) Tick(now time.Time) {
 
 // Sleep momentarily so that other goroutines can process.
 func gosched() { runtime.Gosched() }
+
+// Calls keeps track of the count of calls for each of the methods on the Clock
+// interface.
+type Calls struct {
+	After     uint32
+	AfterFunc uint32
+	Now       uint32
+	Sleep     uint32
+	Tick      uint32
+	Ticker    uint32
+	Timer     uint32
+}
+
+// atLeast returns true if at least the number of calls in o have been made.
+func (c Calls) atLeast(o Calls) bool {
+	if c.After < o.After {
+		return false
+	}
+	if c.AfterFunc < o.AfterFunc {
+		return false
+	}
+	if c.Now < o.Now {
+		return false
+	}
+	if c.Sleep < o.Sleep {
+		return false
+	}
+	if c.Tick < o.Tick {
+		return false
+	}
+	if c.Ticker < o.Ticker {
+		return false
+	}
+	if c.Timer < o.Timer {
+		return false
+	}
+	return true
+}
+
+type waiting struct {
+	expected Calls
+	done     chan struct{}
+}
