@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benbjohnson/clock"
+	"github.com/facebookgo/clock"
 )
 
 // Ensure that the clock's After channel sends at the correct time.
